@@ -396,10 +396,26 @@ async def test_a_built_goal_reports_its_identity_too(path_id):
 
 
 def _pack(language: str) -> dict:
+    from pathlib import Path
+
     import yaml
 
-    prompts = Path(__file__).resolve().parents[2] / "capabilities" / "mastery" / "prompts"
-    return yaml.safe_load((prompts / language / "mastery_loop.yaml").read_text(encoding="utf-8"))
+    # The fixtures are checked in next to the source tree, not next to the
+    # test directory — and pytest invokes this from whatever CWD was set when
+    # the run started (the repo root in CI, ``cwd`` from a developer shell
+    # otherwise). Anchor on this file's location so both work.
+    repo_root = Path(__file__).resolve().parents[3]
+    with open(
+        repo_root
+        / "deeptutor"
+        / "capabilities"
+        / "mastery"
+        / "prompts"
+        / language
+        / "mastery_loop.yaml",
+        encoding="utf-8",
+    ) as handle:
+        return yaml.safe_load(handle)
 
 
 def test_study_never_offers_to_do_the_reviewing_itself(

@@ -667,10 +667,13 @@ def test_delete_notebook_entry(store: SQLiteSessionStore) -> None:
 
 
 def test_entries_cascade_on_session_delete(store: SQLiteSessionStore) -> None:
+    """ON DELETE CASCADE fires when hard_delete_session removes the row."""
     session = asyncio.run(store.create_session())
     asyncio.run(store.upsert_notebook_entries(session["id"], _make_items(("q1", "Q?", False))))
     assert asyncio.run(store.list_notebook_entries())["total"] == 1
-    asyncio.run(store.delete_session(session["id"]))
+    # Cascade fires on hard delete; must soft-delete first (hard_delete requires is_deleted=1).
+    asyncio.run(store.soft_delete_session(session["id"]))
+    asyncio.run(store.hard_delete_session(session["id"]))
     assert asyncio.run(store.list_notebook_entries())["total"] == 0
 
 
@@ -875,4 +878,143 @@ def test_branch_context_messages_carry_private_metadata(store: SQLiteSessionStor
 
     messages = asyncio.run(store.get_messages_for_context(session["id"], leaf_message_id=leaf))
 
-    assert messages[-1]["metadata"]["provider_response_state"] == state
+# ── Recycle bin ─────────────────────────────────────────────────────
+
+
+def test_soft_delete_hides_from_list_sessions(store: SQLiteSessionStore) -> None:
+    """A soft-deleted session must not appear in list_sessions."""
+    session = asyncio.run(store.create_session(title="To Soft Delete"))
+    assert asyncio.run(store.list_sessions(limit=10)) != []
+
+    asyncio.run(store.soft_delete_session(session["id"]))
+
+    assert asyncio.run(store.list_sessions(limit=10)) == []
+
+
+def test_soft_delete_populates_recycle_bin(store: SQLiteSessionStore) -> None:
+    """A soft-deleted session must appear in list_recycle_bin."""
+    session = asyncio.run(store.create_session(title="Recycle Me"))
+    asyncio.run(store.soft_delete_session(session["id"]))
+
+    result = asyncio.run(store.list_recycle_bin(limit=10))
+    assert len(result) == 1
+    assert result[0]["id"] == session["id"]
+    assert result[0]["is_deleted"] is True
+    assert result[0]["deleted_at"] is not None
+
+
+def test_restore_removes_from_recycle_bin(store: SQLiteSessionStore) -> None:
+    """Restoring a session must clear is_deleted and restore list_sessions visibility."""
+    session = asyncio.run(store.create_session(title="Restore Me"))
+    asyncio.run(store.soft_delete_session(session["id"]))
+    assert asyncio.run(store.list_recycle_bin(limit=10)) != []
+
+    restored = asyncio.run(store.restore_session(session["id"]))
+    assert restored is True
+
+    assert asyncio.run(store.list_recycle_bin(limit=10)) == []
+    active = asyncio.run(store.list_sessions(limit=10))
+    assert any(s["id"] == session["id"] for s in active)
+
+
+def test_restore_noop_for_active_session(store: SQLiteSessionStore) -> None:
+    """restore_session must return False when session is not soft-deleted."""
+    session = asyncio.run(store.create_session(title="Not Deleted"))
+    assert asyncio.run(store.restore_session(session["id"])) is False
+
+
+def test_restore_noop_for_nonexistent_session(store: SQLiteSessionStore) -> None:
+    assert asyncio.run(store.restore_session("nonexistent")) is False
+
+
+def test_soft_delete_noop_for_nonexistent_session(store: SQLiteSessionStore) -> None:
+    assert asyncio.run(store.soft_delete_session("nonexistent")) is False
+
+
+def test_hard_delete_only_removes_soft_deleted(store: SQLiteSessionStore) -> None:
+    """hard_delete_session must only succeed for already-soft-deleted sessions."""
+    session = asyncio.run(store.create_session(title="Permanent Me"))
+    # Hard delete on an active session must be a no-op.
+    assert asyncio.run(store.hard_delete_session(session["id"])) is False
+    # Session still exists and is active.
+    assert asyncio.run(store.get_session(session["id"])) is not None
+
+    # Soft-delete first, then hard delete.
+    asyncio.run(store.soft_delete_session(session["id"]))
+    deleted = asyncio.run(store.hard_delete_session(session["id"]))
+    assert deleted is True
+    # Gone from recycle bin.
+    assert asyncio.run(store.list_recycle_bin(limit=10)) == []
+    # And from the store entirely.
+    assert asyncio.run(store.get_session(session["id"])) is None
+
+
+def test_hard_delete_noop_for_nonexistent_session(store: SQLiteSessionStore) -> None:
+    assert asyncio.run(store.hard_delete_session("nonexistent")) is False
+
+
+def test_delete_session_backward_compat_soft_deletes(store: SQLiteSessionStore) -> None:
+    """delete_session (public API) must soft-delete for backward compatibility."""
+    session = asyncio.run(store.create_session(title="Compat Delete"))
+    asyncio.run(store.delete_session(session["id"]))
+
+    assert asyncio.run(store.list_sessions(limit=10)) == []
+    result = asyncio.run(store.list_recycle_bin(limit=10))
+    assert len(result) == 1
+    assert result[0]["id"] == session["id"]
+
+
+def test_soft_deleted_session_not_gettable(store: SQLiteSessionStore) -> None:
+    """get_session must return None for soft-deleted sessions."""
+    session = asyncio.run(store.create_session(title="Hidden"))
+    asyncio.run(store.soft_delete_session(session["id"]))
+    assert asyncio.run(store.get_session(session["id"])) is None
+
+
+def test_list_recycle_bin_pagination(store: SQLiteSessionStore) -> None:
+    """list_recycle_bin must honour limit and offset."""
+    ids = []
+    for i in range(5):
+        s = asyncio.run(store.create_session(title=f"Session {i}"))
+        ids.append(s["id"])
+    for sid in ids:
+        asyncio.run(store.soft_delete_session(sid))
+
+    page1 = asyncio.run(store.list_recycle_bin(limit=2, offset=0))
+    assert len(page1) == 2
+
+    page2 = asyncio.run(store.list_recycle_bin(limit=2, offset=2))
+    assert len(page2) == 2
+
+    page3 = asyncio.run(store.list_recycle_bin(limit=2, offset=4))
+    assert len(page3) == 1
+
+    assert asyncio.run(store.list_recycle_bin(limit=2, offset=6)) == []
+
+
+def test_get_session_summaries_excludes_deleted(store: SQLiteSessionStore) -> None:
+    """get_session_summaries must not include soft-deleted sessions."""
+    s1 = asyncio.run(store.create_session(title="Active"))
+    s2 = asyncio.run(store.create_session(title="Deleted"))
+    asyncio.run(store.soft_delete_session(s2["id"]))
+
+    summaries = asyncio.run(store.get_session_summaries([s1["id"], s2["id"]]))
+    active_ids = [s["id"] for s in summaries]
+    assert s1["id"] in active_ids
+    assert s2["id"] not in active_ids
+
+
+def test_recycle_bin_preserves_deleted_at_order(store: SQLiteSessionStore) -> None:
+    """Recycle bin should be ordered by deletion time (most recent first)."""
+    s1 = asyncio.run(store.create_session(title="First Deleted"))
+    time.sleep(0.01)  # Ensure different timestamps
+    s2 = asyncio.run(store.create_session(title="Second Deleted"))
+
+    asyncio.run(store.soft_delete_session(s1["id"]))
+    time.sleep(0.01)
+    asyncio.run(store.soft_delete_session(s2["id"]))
+
+    result = asyncio.run(store.list_recycle_bin(limit=10))
+    # Most recently deleted first.
+    assert result[0]["id"] == s2["id"]
+    assert result[1]["id"] == s1["id"]

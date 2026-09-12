@@ -277,6 +277,46 @@ async def delete_session(session_id: str):
     return {"deleted": True, "session_id": session_id}
 
 
+@router.get("/recycle-bin")
+async def list_recycle_bin(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    """List soft-deleted sessions in the recycle bin."""
+    store = get_session_store()
+    sessions = await store.list_recycle_bin(limit=limit, offset=offset)
+    return {"sessions": sessions}
+
+
+@router.post("/{session_id}/restore")
+async def restore_session(session_id: str):
+    """Restore a soft-deleted session from the recycle bin."""
+    store = get_session_store()
+    restored = await store.restore_session(session_id)
+    if not restored:
+        raise HTTPException(status_code=404, detail="Session not found or not in recycle bin")
+    session = await store.get_session(session_id)
+    return {"restored": True, "session_id": session_id, "session": session}
+
+
+@router.delete("/{session_id}/permanent")
+async def permanent_delete_session(session_id: str):
+    """Permanently delete a session from the recycle bin. Only succeeds if already soft-deleted."""
+    store = get_session_store()
+    deleted = await store.hard_delete_session(session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Session not found in recycle bin")
+    try:
+        await asyncio.to_thread(LearningStore().detach_session, session_id)
+    except Exception:
+        logger.exception("failed to detach mastery paths for session %s", session_id)
+    try:
+        await get_attachment_store().delete_session(session_id)
+    except Exception:
+        logger.exception("failed to clean up attachments for session %s", session_id)
+    return {"permanently_deleted": True, "session_id": session_id}
+
+
 @router.put("/{session_id}/branch-selection")
 async def update_branch_selection(session_id: str, payload: BranchSelectionRequest):
     store = get_sqlite_session_store()

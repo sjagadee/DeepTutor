@@ -19,6 +19,9 @@ def test_delete_session_cleans_only_current_user_artifacts(as_user, monkeypatch)
         async def delete_session(self, candidate: str) -> bool:
             return candidate == session_id
 
+        async def hard_delete_session(self, candidate: str) -> bool:
+            return candidate == session_id
+
     monkeypatch.setattr(sessions_router, "get_session_store", lambda: _SessionStore())
     reset_attachment_store()
 
@@ -53,6 +56,15 @@ def test_delete_session_cleans_only_current_user_artifacts(as_user, monkeypatch)
             response = await sessions_router.delete_session(session_id)
 
         assert response == {"deleted": True, "session_id": session_id}
+        # Soft-delete keeps artifacts intact so `restore_session` can bring
+        # the conversation back fully; only permanent delete tears them down.
+        assert await _artifacts_exist("u_alice") == (True, True)
+        assert await _artifacts_exist("u_bob") == (True, True)
+
+        with as_user("u_alice"):
+            permanent_response = await sessions_router.permanent_delete_session(session_id)
+
+        assert permanent_response == {"permanently_deleted": True, "session_id": session_id}
         assert await _artifacts_exist("u_alice") == (False, False)
         assert await _artifacts_exist("u_bob") == (True, True)
 

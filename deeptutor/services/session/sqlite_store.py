@@ -370,7 +370,9 @@ class SQLiteSessionStore:
             )
             columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
             if "is_deleted" not in columns:
-                conn.execute("ALTER TABLE sessions ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0"
+                )
             if "deleted_at" not in columns:
                 conn.execute("ALTER TABLE sessions ADD COLUMN deleted_at REAL")
             # Must ensure preferences_json exists before the migration reads it;
@@ -1405,14 +1407,14 @@ class SQLiteSessionStore:
         """Permanently delete a session from the recycle bin."""
         return await self._run(self._hard_delete_session_sync, session_id)
 
-    async def list_recycle_bin(
-        self, limit: int = 50, offset: int = 0
-    ) -> list[dict[str, Any]]:
+    async def list_recycle_bin(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         """List soft-deleted sessions ordered by deletion time."""
         return await self._run(self._list_recycle_bin_sync, limit, offset)
 
     def _list_recycle_bin_sync(self, limit: int, offset: int) -> list[dict[str, Any]]:
-        return self._list_session_summaries_sync(self._WHERE_DELETED, limit, offset)
+        return self._list_session_summaries_sync(
+            self._WHERE_DELETED, limit, offset, order_by="s.deleted_at DESC"
+        )
 
     # Keep delete_session as soft-delete for backward compatibility
     async def delete_session(self, session_id: str) -> bool:
@@ -2156,7 +2158,7 @@ class SQLiteSessionStore:
         LEFT JOIN messages m ON m.session_id = s.id
         {where}
         GROUP BY s.id
-        ORDER BY s.updated_at DESC
+        ORDER BY {order_by}
         LIMIT ? OFFSET ?
     """
 
@@ -2190,15 +2192,18 @@ class SQLiteSessionStore:
     _WHERE_DELETED = r"WHERE s.is_deleted = 1"
 
     def _list_session_summaries_sync(
-        self, where_sql: str, limit: int, offset: int
+        self,
+        where_sql: str,
+        limit: int,
+        offset: int,
+        order_by: str = "s.updated_at DESC",
     ) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
-                self._SESSION_SUMMARY_SQL.format(where=where_sql),
+                self._SESSION_SUMMARY_SQL.format(where=where_sql, order_by=order_by),
                 (limit, offset),
             ).fetchall()
         return [self._session_summary_payload(row) for row in rows]
-
 
     def _get_session_summaries_sync(
         self,
@@ -2212,7 +2217,7 @@ class SQLiteSessionStore:
         where = f"WHERE s.id IN ({placeholders}) AND s.is_deleted = 0"
         with self._connect() as conn:
             rows = conn.execute(
-                self._SESSION_SUMMARY_SQL.format(where=where),
+                self._SESSION_SUMMARY_SQL.format(where=where, order_by="s.updated_at DESC"),
                 (*ids, len(ids), 0),
             ).fetchall()
         return [self._session_summary_payload(row) for row in rows]

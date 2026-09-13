@@ -154,6 +154,21 @@ def _truncate_oversized_events(
                 event["_truncated"] = True
 
 
+@router.get("/recycle-bin")
+async def list_recycle_bin(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    """List soft-deleted sessions in the recycle bin.
+
+    Registered before ``/{session_id}`` so FastAPI's order-sensitive routing
+    doesn't swallow this path as a session id lookup.
+    """
+    store = get_session_store()
+    sessions = await store.list_recycle_bin(limit=limit, offset=offset)
+    return {"sessions": sessions}
+
+
 @router.get("/{session_id}")
 async def get_session(session_id: str):
     store = get_session_store()
@@ -266,26 +281,11 @@ async def delete_session(session_id: str):
     deleted = await store.delete_session(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
-    try:
-        await asyncio.to_thread(LearningStore().detach_session, session_id)
-    except Exception:
-        logger.exception("failed to detach mastery paths for session %s", session_id)
-    try:
-        await get_attachment_store().delete_session(session_id)
-    except Exception:
-        logger.exception("failed to clean up attachments for session %s", session_id)
+    # Soft-delete only: attachments and mastery paths stay attached so
+    # restore_session brings back a fully intact conversation. They are only
+    # torn down in permanent_delete_session, once recovery is no longer
+    # possible.
     return {"deleted": True, "session_id": session_id}
-
-
-@router.get("/recycle-bin")
-async def list_recycle_bin(
-    limit: int = Query(default=50, ge=1, le=200),
-    offset: int = Query(default=0, ge=0),
-):
-    """List soft-deleted sessions in the recycle bin."""
-    store = get_session_store()
-    sessions = await store.list_recycle_bin(limit=limit, offset=offset)
-    return {"sessions": sessions}
 
 
 @router.post("/{session_id}/restore")

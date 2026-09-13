@@ -878,6 +878,7 @@ def test_branch_context_messages_carry_private_metadata(store: SQLiteSessionStor
 
     messages = asyncio.run(store.get_messages_for_context(session["id"], leaf_message_id=leaf))
 
+
 # ── Recycle bin ─────────────────────────────────────────────────────
 
 

@@ -106,6 +106,25 @@ async def list_sessions(
     return {"sessions": sessions}
 
 
+@router.get("/search")
+async def search_sessions(
+    q: str = Query(..., min_length=1, max_length=200, description="Search query"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    """Search across session titles and all user/assistant message content.
+
+    Returns one result per matched session with a bounded excerpt and
+    message metadata for navigation into the conversation.
+    """
+    store = get_session_store()
+    results = await store.search_sessions(
+        query=q,
+        limit=limit,
+        offset=offset,
+    )
+    return {"sessions": results}
+
 # Cap (in characters) for a single event payload returned to the UI. RAG
 # tools can attach whole KB documents to ``tool_result``/``observation``
 # events; the frontend TraceSurface only needs a preview, and the LLM context

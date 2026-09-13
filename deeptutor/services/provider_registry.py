@@ -59,6 +59,8 @@ class ProviderSpec:
     # Exact matching is intentional: providers often expose Responses only on
     # one model even when sibling models share the same family prefix.
     native_web_search_models: tuple[str, ...] = ()
+    # Exact model IDs that should be treated as verbatim matches (e.g. gpt-5.6-terra).
+    exact_model_ids: tuple[str, ...] = ()
     # Endpoints a vendor exposes for a *non-default* API format, e.g. MiniMax
     # serving Anthropic Messages at ``/anthropic`` next to its OpenAI-style
     # ``/v1``. ``default_api_base`` stays the default format's endpoint.

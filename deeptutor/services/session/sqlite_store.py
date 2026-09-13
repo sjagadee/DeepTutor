@@ -40,7 +40,7 @@ def _json_dumps(value: Any) -> str:
 
 def _escape_like(value: str) -> str:
     """Escape LIKE wildcards so a search term matches itself literally."""
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return value.replace("\\", "\\\\").replace("~", "~~").replace("%", "~%").replace("_", "~_")
 
 
 @contextmanager
@@ -248,7 +248,9 @@ class SQLiteSessionStore:
                     updated_at REAL NOT NULL,
                     compressed_summary TEXT DEFAULT '',
                     summary_up_to_msg_id INTEGER DEFAULT 0,
-                    preferences_json TEXT DEFAULT '{}'
+                    preferences_json TEXT DEFAULT '{}',
+                    is_deleted INTEGER NOT NULL DEFAULT 0,
+                    deleted_at REAL
                 );
 
                 CREATE TABLE IF NOT EXISTS messages (
@@ -367,6 +369,12 @@ class SQLiteSessionStore:
                 """
             )
             columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+            if "is_deleted" not in columns:
+                conn.execute("ALTER TABLE sessions ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
+            if "deleted_at" not in columns:
+                conn.execute("ALTER TABLE sessions ADD COLUMN deleted_at REAL")
+            # Must ensure preferences_json exists before the migration reads it;
+            # the columns set captured above reflects the pre-migration schema.
             if "preferences_json" not in columns:
                 conn.execute("ALTER TABLE sessions ADD COLUMN preferences_json TEXT DEFAULT '{}'")
             self._migrate_workspace_preferences(conn)
@@ -782,7 +790,7 @@ class SQLiteSessionStore:
                     ) AS capability
                 FROM sessions
                 s
-                WHERE s.id = ?
+                WHERE s.id = ? AND s.is_deleted = 0
                 """,
                 (session_id,),
             ).fetchone()
@@ -1354,14 +1362,166 @@ class SQLiteSessionStore:
     async def update_session_title(self, session_id: str, title: str) -> bool:
         return await self._run(self._update_session_title_sync, session_id, title)
 
-    def _delete_session_sync(self, session_id: str) -> bool:
+    def _soft_delete_session_sync(self, session_id: str) -> bool:
+        """Set is_deleted=1 instead of removing the row — enables restore."""
+        now = time.time()
         with self._connect() as conn:
-            cur = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            cur = conn.execute(
+                "UPDATE sessions SET is_deleted = 1, deleted_at = ? WHERE id = ? AND is_deleted = 0",
+                (now, session_id),
+            )
             conn.commit()
         return cur.rowcount > 0
 
+    async def soft_delete_session(self, session_id: str) -> bool:
+        """Move a session to the recycle bin (soft delete)."""
+        return await self._run(self._soft_delete_session_sync, session_id)
+
+    def _restore_session_sync(self, session_id: str) -> bool:
+        """Clear is_deleted to bring a session back from the recycle bin."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE sessions SET is_deleted = 0 WHERE id = ? AND is_deleted = 1",
+                (session_id,),
+            )
+            conn.commit()
+        return cur.rowcount > 0
+
+    async def restore_session(self, session_id: str) -> bool:
+        """Restore a soft-deleted session from the recycle bin."""
+        return await self._run(self._restore_session_sync, session_id)
+
+    def _hard_delete_session_sync(self, session_id: str) -> bool:
+        """Permanently remove a session — only allowed when already soft-deleted."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM sessions WHERE id = ? AND is_deleted = 1",
+                (session_id,),
+            )
+            conn.commit()
+        return cur.rowcount > 0
+
+    async def hard_delete_session(self, session_id: str) -> bool:
+        """Permanently delete a session from the recycle bin."""
+        return await self._run(self._hard_delete_session_sync, session_id)
+
+    async def list_recycle_bin(
+        self, limit: int = 50, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """List soft-deleted sessions ordered by deletion time."""
+        return await self._run(self._list_recycle_bin_sync, limit, offset)
+
+    def _list_recycle_bin_sync(self, limit: int, offset: int) -> list[dict[str, Any]]:
+        return self._list_session_summaries_sync(self._WHERE_DELETED, limit, offset)
+
+    # ------------------------------------------------------------------
+    # Full-text search
+    # ------------------------------------------------------------------
+    _SEARCH_SQL = """
+        SELECT
+          s.id,
+          s.title,
+          s.created_at,
+          s.updated_at,
+          s.compressed_summary,
+          s.summary_up_to_msg_id,
+          s.preferences_json,
+          s.is_deleted,
+          (SELECT COUNT(*) FROM messages m2 WHERE m2.session_id = s.id AND m2.role != 'system') AS message_count,
+          COALESCE((SELECT t.status FROM turns t WHERE t.session_id = s.id ORDER BY t.updated_at DESC LIMIT 1), 'idle') AS status,
+          COALESCE((SELECT t.id FROM turns t WHERE t.session_id = s.id AND t.status IN ('queued', 'running', 'waiting_input') ORDER BY t.updated_at DESC LIMIT 1), '') AS active_turn_id,
+          COALESCE((SELECT t.capability FROM turns t WHERE t.session_id = s.id ORDER BY t.updated_at DESC LIMIT 1), '') AS capability,
+          COALESCE((SELECT m3.content FROM messages m3 WHERE m3.session_id = s.id AND m3.role != 'system' AND TRIM(COALESCE(m3.content, '')) != '' ORDER BY m3.id DESC LIMIT 1), '') AS last_message,
+          best.message_id AS matched_message_id,
+          best.role AS matched_role,
+          best.content AS matched_content,
+          best.created_at AS matched_message_created_at
+        FROM (
+          SELECT *,
+            ROW_NUMBER() OVER (
+              PARTITION BY session_id
+              ORDER BY CASE WHEN message_id = 0 THEN 0 ELSE 1 END, created_at DESC
+            ) AS rn
+          FROM (
+            SELECT session_id, id AS message_id, role, content, created_at
+            FROM messages
+            WHERE content LIKE ('%' || :query || '%') ESCAPE '~'
+              AND role != 'system'
+            UNION ALL
+            SELECT id AS session_id, 0 AS message_id, 'title' AS role, title AS content, created_at
+            FROM sessions
+            WHERE title LIKE ('%' || :query || '%') ESCAPE '~'
+              AND is_deleted = 0
+              AND id NOT LIKE 'imported~_%' ESCAPE '~'
+          )
+        ) AS best
+        JOIN sessions s ON s.id = best.session_id
+        WHERE best.session_id IS NOT NULL
+          AND best.rn = 1
+          AND s.is_deleted = 0
+          AND s.id NOT LIKE 'imported~_%' ESCAPE '~'
+        ORDER BY s.updated_at DESC
+        LIMIT :limit OFFSET :offset
+    """
+
+    def _search_sessions_sync(
+        self, query: str, limit: int, offset: int
+    ) -> list[dict[str, Any]]:
+        escaped = _escape_like(query)
+        with self._connect() as conn:
+            rows = conn.execute(
+                self._SEARCH_SQL,
+                {"query": escaped, "limit": limit, "offset": offset},
+            ).fetchall()
+        # Guard against malformed empty-result rows with NULL session id
+        if not rows or rows[0]["id"] is None:
+            return []
+        results = []
+        for row in rows:
+            payload = dict(row)
+            payload["session_id"] = payload["id"]
+            payload["preferences"] = _json_loads(payload.pop("preferences_json", ""), {})
+            payload["is_deleted"] = bool(payload.get("is_deleted"))
+            matched_content = payload.pop("matched_content", None)
+            matched_role = payload.pop("matched_role", None)
+            matched_id = payload.pop("matched_message_id", None)
+            matched_created = payload.pop("matched_message_created_at", None)
+            if matched_id == 0 or matched_role == "title":
+                # Title match -- use last_message as excerpt for context.
+                payload["excerpt"] = payload.get("last_message") or None
+                payload["excerpt_role"] = None
+                payload["excerpt_message_id"] = None
+            elif matched_content:
+                payload["excerpt"] = (
+                    (matched_content[:200] + "…") if len(matched_content) > 200 else matched_content
+                )
+                payload["excerpt_role"] = matched_role
+                payload["excerpt_message_id"] = matched_id
+            else:
+                payload["excerpt"] = None
+                payload["excerpt_role"] = None
+                payload["excerpt_message_id"] = None
+            payload["excerpt_timestamp"] = matched_created
+            results.append(payload)
+        return results
+    async def search_sessions(
+        self,
+        query: str,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Search sessions by title and message content, returning one result per session."""
+        if not query or not query.strip():
+            return []
+        return await self._run(self._search_sessions_sync, query.strip(), limit, offset)
+
+
+    # Keep delete_session as soft-delete for backward compatibility
     async def delete_session(self, session_id: str) -> bool:
-        return await self._run(self._delete_session_sync, session_id)
+        return await self.soft_delete_session(session_id)
+
+    def _delete_session_sync(self, session_id: str) -> bool:
+        return self._soft_delete_session_sync(session_id)
 
     def _add_message_sync(
         self,
@@ -2068,6 +2228,8 @@ class SQLiteSessionStore:
             s.compressed_summary,
             s.summary_up_to_msg_id,
             s.preferences_json,
+            s.is_deleted,
+            s.deleted_at,
             COUNT(CASE WHEN m.role != 'system' THEN 1 END) AS message_count,
             COALESCE(
                 (SELECT t.status FROM turns t WHERE t.session_id = s.id
@@ -2100,6 +2262,14 @@ class SQLiteSessionStore:
         LIMIT ? OFFSET ?
     """
 
+    @staticmethod
+    def _session_summary_payload(row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        payload["session_id"] = payload["id"]
+        payload["preferences"] = _json_loads(payload.pop("preferences_json", ""), {})
+        payload["is_deleted"] = bool(payload.get("is_deleted"))
+        return payload
+
     # ``ESCAPE '\'`` makes the underscore in ``imported_`` literal rather than
     # the LIKE single-char wildcard.
     #
@@ -2112,9 +2282,14 @@ class SQLiteSessionStore:
     # their collection and ``sessionRoute`` sends a click back to the reader,
     # so they belong in the list like everything else.
     _WHERE_NATIVE = r"""
-        WHERE s.id NOT LIKE 'imported\_%' ESCAPE '\'
+        WHERE s.id NOT LIKE 'imported~_%' ESCAPE '~'
+          AND s.is_deleted = 0
     """
-    _WHERE_IMPORTED = r"WHERE s.id LIKE 'imported\_%' ESCAPE '\'"
+    _WHERE_IMPORTED = r"""
+        WHERE s.id LIKE 'imported~_%' ESCAPE '~'
+          AND s.is_deleted = 0
+    """
+    _WHERE_DELETED = r"WHERE s.is_deleted = 1"
 
     def _list_session_summaries_sync(
         self, where_sql: str, limit: int, offset: int
@@ -2126,12 +2301,6 @@ class SQLiteSessionStore:
             ).fetchall()
         return [self._session_summary_payload(row) for row in rows]
 
-    @staticmethod
-    def _session_summary_payload(row: sqlite3.Row) -> dict[str, Any]:
-        payload = dict(row)
-        payload["session_id"] = payload["id"]
-        payload["preferences"] = _json_loads(payload.pop("preferences_json", ""), {})
-        return payload
 
     def _get_session_summaries_sync(
         self,
@@ -2142,7 +2311,7 @@ class SQLiteSessionStore:
         if not ids:
             return []
         placeholders = ",".join("?" for _ in ids)
-        where = f"WHERE s.id IN ({placeholders})"
+        where = f"WHERE s.id IN ({placeholders}) AND s.is_deleted = 0"
         with self._connect() as conn:
             rows = conn.execute(
                 self._SESSION_SUMMARY_SQL.format(where=where),
@@ -2498,8 +2667,8 @@ class SQLiteSessionStore:
             # matches instead of the wildcards those characters would be.
             needle = f"%{_escape_like(query.search)}%"
             conditions.append(
-                "(n.question LIKE ? ESCAPE '\\' OR n.user_answer LIKE ? ESCAPE '\\' "
-                "OR n.correct_answer LIKE ? ESCAPE '\\' OR n.explanation LIKE ? ESCAPE '\\')"
+                "(n.question LIKE ? ESCAPE '~' OR n.user_answer LIKE ? ESCAPE '~' "
+                "OR n.correct_answer LIKE ? ESCAPE '~' OR n.explanation LIKE ? ESCAPE '~')"
             )
             params.extend([needle] * 4)
 

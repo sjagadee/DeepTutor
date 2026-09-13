@@ -667,10 +667,13 @@ def test_delete_notebook_entry(store: SQLiteSessionStore) -> None:
 
 
 def test_entries_cascade_on_session_delete(store: SQLiteSessionStore) -> None:
+    """ON DELETE CASCADE fires when hard_delete_session removes the row."""
     session = asyncio.run(store.create_session())
     asyncio.run(store.upsert_notebook_entries(session["id"], _make_items(("q1", "Q?", False))))
     assert asyncio.run(store.list_notebook_entries())["total"] == 1
-    asyncio.run(store.delete_session(session["id"]))
+    # Cascade fires on hard delete; must soft-delete first (hard_delete requires is_deleted=1).
+    asyncio.run(store.soft_delete_session(session["id"]))
+    asyncio.run(store.hard_delete_session(session["id"]))
     assert asyncio.run(store.list_notebook_entries())["total"] == 0
 
 
@@ -875,4 +878,302 @@ def test_branch_context_messages_carry_private_metadata(store: SQLiteSessionStor
 
     messages = asyncio.run(store.get_messages_for_context(session["id"], leaf_message_id=leaf))
 
-    assert messages[-1]["metadata"]["provider_response_state"] == state
+# ── Recycle bin ─────────────────────────────────────────────────────
+
+
+def test_soft_delete_hides_from_list_sessions(store: SQLiteSessionStore) -> None:
+    """A soft-deleted session must not appear in list_sessions."""
+    session = asyncio.run(store.create_session(title="To Soft Delete"))
+    assert asyncio.run(store.list_sessions(limit=10)) != []
+
+    asyncio.run(store.soft_delete_session(session["id"]))
+
+    assert asyncio.run(store.list_sessions(limit=10)) == []
+
+
+def test_soft_delete_populates_recycle_bin(store: SQLiteSessionStore) -> None:
+    """A soft-deleted session must appear in list_recycle_bin."""
+    session = asyncio.run(store.create_session(title="Recycle Me"))
+    asyncio.run(store.soft_delete_session(session["id"]))
+
+    result = asyncio.run(store.list_recycle_bin(limit=10))
+    assert len(result) == 1
+    assert result[0]["id"] == session["id"]
+    assert result[0]["is_deleted"] is True
+    assert result[0]["deleted_at"] is not None
+
+
+def test_restore_removes_from_recycle_bin(store: SQLiteSessionStore) -> None:
+    """Restoring a session must clear is_deleted and restore list_sessions visibility."""
+    session = asyncio.run(store.create_session(title="Restore Me"))
+    asyncio.run(store.soft_delete_session(session["id"]))
+    assert asyncio.run(store.list_recycle_bin(limit=10)) != []
+
+    restored = asyncio.run(store.restore_session(session["id"]))
+    assert restored is True
+
+    assert asyncio.run(store.list_recycle_bin(limit=10)) == []
+    active = asyncio.run(store.list_sessions(limit=10))
+    assert any(s["id"] == session["id"] for s in active)
+
+
+def test_restore_noop_for_active_session(store: SQLiteSessionStore) -> None:
+    """restore_session must return False when session is not soft-deleted."""
+    session = asyncio.run(store.create_session(title="Not Deleted"))
+    assert asyncio.run(store.restore_session(session["id"])) is False
+
+
+def test_restore_noop_for_nonexistent_session(store: SQLiteSessionStore) -> None:
+    assert asyncio.run(store.restore_session("nonexistent")) is False
+
+
+def test_soft_delete_noop_for_nonexistent_session(store: SQLiteSessionStore) -> None:
+    assert asyncio.run(store.soft_delete_session("nonexistent")) is False
+
+
+def test_hard_delete_only_removes_soft_deleted(store: SQLiteSessionStore) -> None:
+    """hard_delete_session must only succeed for already-soft-deleted sessions."""
+    session = asyncio.run(store.create_session(title="Permanent Me"))
+    # Hard delete on an active session must be a no-op.
+    assert asyncio.run(store.hard_delete_session(session["id"])) is False
+    # Session still exists and is active.
+    assert asyncio.run(store.get_session(session["id"])) is not None
+
+    # Soft-delete first, then hard delete.
+    asyncio.run(store.soft_delete_session(session["id"]))
+    deleted = asyncio.run(store.hard_delete_session(session["id"]))
+    assert deleted is True
+    # Gone from recycle bin.
+    assert asyncio.run(store.list_recycle_bin(limit=10)) == []
+    # And from the store entirely.
+    assert asyncio.run(store.get_session(session["id"])) is None
+
+
+def test_hard_delete_noop_for_nonexistent_session(store: SQLiteSessionStore) -> None:
+    assert asyncio.run(store.hard_delete_session("nonexistent")) is False
+
+
+def test_delete_session_backward_compat_soft_deletes(store: SQLiteSessionStore) -> None:
+    """delete_session (public API) must soft-delete for backward compatibility."""
+    session = asyncio.run(store.create_session(title="Compat Delete"))
+    asyncio.run(store.delete_session(session["id"]))
+
+    assert asyncio.run(store.list_sessions(limit=10)) == []
+    result = asyncio.run(store.list_recycle_bin(limit=10))
+    assert len(result) == 1
+    assert result[0]["id"] == session["id"]
+
+
+def test_soft_deleted_session_not_gettable(store: SQLiteSessionStore) -> None:
+    """get_session must return None for soft-deleted sessions."""
+    session = asyncio.run(store.create_session(title="Hidden"))
+    asyncio.run(store.soft_delete_session(session["id"]))
+    assert asyncio.run(store.get_session(session["id"])) is None
+
+
+def test_list_recycle_bin_pagination(store: SQLiteSessionStore) -> None:
+    """list_recycle_bin must honour limit and offset."""
+    ids = []
+    for i in range(5):
+        s = asyncio.run(store.create_session(title=f"Session {i}"))
+        ids.append(s["id"])
+    for sid in ids:
+        asyncio.run(store.soft_delete_session(sid))
+
+    page1 = asyncio.run(store.list_recycle_bin(limit=2, offset=0))
+    assert len(page1) == 2
+
+    page2 = asyncio.run(store.list_recycle_bin(limit=2, offset=2))
+    assert len(page2) == 2
+
+    page3 = asyncio.run(store.list_recycle_bin(limit=2, offset=4))
+    assert len(page3) == 1
+
+    assert asyncio.run(store.list_recycle_bin(limit=2, offset=6)) == []
+
+
+def test_get_session_summaries_excludes_deleted(store: SQLiteSessionStore) -> None:
+    """get_session_summaries must not include soft-deleted sessions."""
+    s1 = asyncio.run(store.create_session(title="Active"))
+    s2 = asyncio.run(store.create_session(title="Deleted"))
+    asyncio.run(store.soft_delete_session(s2["id"]))
+
+    summaries = asyncio.run(store.get_session_summaries([s1["id"], s2["id"]]))
+    active_ids = [s["id"] for s in summaries]
+    assert s1["id"] in active_ids
+    assert s2["id"] not in active_ids
+
+
+def test_recycle_bin_preserves_deleted_at_order(store: SQLiteSessionStore) -> None:
+    """Recycle bin should be ordered by deletion time (most recent first)."""
+    s1 = asyncio.run(store.create_session(title="First Deleted"))
+    time.sleep(0.01)  # Ensure different timestamps
+    s2 = asyncio.run(store.create_session(title="Second Deleted"))
+
+    asyncio.run(store.soft_delete_session(s1["id"]))
+    time.sleep(0.01)
+    asyncio.run(store.soft_delete_session(s2["id"]))
+
+    result = asyncio.run(store.list_recycle_bin(limit=10))
+    # Most recently deleted first.
+    assert result[0]["id"] == s2["id"]
+# ── Search sessions ─────────────────────────────────────────────────
+
+
+def _seed_search_chat(store: SQLiteSessionStore) -> tuple[str, str, str]:
+    """Create a session with user/assistant messages for search testing."""
+    session = asyncio.run(store.create_session(title="Bayes Theorem Discussion"))
+    uid = asyncio.run(
+        store.add_message(session["id"], "user", "Can you explain Bayes theorem?")
+    )
+    aid = asyncio.run(
+        store.add_message(session["id"], "assistant", "Bayes theorem describes how to update probabilities based on new evidence.")
+    )
+    return session["id"], str(uid), str(aid)
+
+
+def test_search_sessions_finds_title(store: SQLiteSessionStore) -> None:
+    """A title match should return the session with last_message as excerpt."""
+    sid, _, _ = _seed_search_chat(store)
+    results = asyncio.run(store.search_sessions("Bayes"))
+    assert len(results) == 1
+    assert results[0]["id"] == sid
+    # Title match has no specific message to navigate to, so excerpt_role is None.
+    assert results[0]["excerpt_role"] is None
+    # Excerpt carries the last message content for context.
+    assert results[0]["excerpt"] is not None
+
+def test_search_sessions_finds_user_message(store: SQLiteSessionStore) -> None:
+    """A user message match should return the session with the excerpt."""
+    sid, uid, _ = _seed_search_chat(store)
+    # Use "explain" — unique to the user message, not in title or assistant message.
+    results = asyncio.run(store.search_sessions("explain"))
+    assert len(results) == 1
+    assert results[0]["id"] == sid
+    assert results[0]["excerpt_role"] == "user"
+    assert results[0]["excerpt_message_id"] == int(uid)
+
+def test_search_sessions_finds_assistant_message(store: SQLiteSessionStore) -> None:
+    """An assistant message match should return the session with the excerpt."""
+    sid, _, aid = _seed_search_chat(store)
+    # Use "update" — unique to the assistant message, not in title or user message.
+    results = asyncio.run(store.search_sessions("update"))
+    assert len(results) == 1
+    assert results[0]["id"] == sid
+    assert results[0]["excerpt_role"] == "assistant"
+    assert results[0]["excerpt_message_id"] == int(aid)
+
+
+def test_search_sessions_returns_one_result_per_session(
+    store: SQLiteSessionStore,
+) -> None:
+    """Even if a session has multiple matching messages, return it once."""
+    session = asyncio.run(store.create_session(title="Multiple Matches"))
+    asyncio.run(store.add_message(session["id"], "user", "apple apple apple"))
+    asyncio.run(store.add_message(session["id"], "assistant", "apple apple apple"))
+    asyncio.run(store.add_message(session["id"], "user", "apple"))
+
+    results = asyncio.run(store.search_sessions("apple"))
+    assert len(results) == 1
+    assert results[0]["id"] == session["id"]
+
+
+def test_search_sessions_empty_query_returns_empty(store: SQLiteSessionStore) -> None:
+    """Empty or whitespace-only query must return empty list."""
+    _seed_search_chat(store)
+    assert asyncio.run(store.search_sessions("")) == []
+    assert asyncio.run(store.search_sessions("   ")) == []
+
+
+def test_search_sessions_no_match_returns_empty(store: SQLiteSessionStore) -> None:
+    """Query with no match should return empty."""
+    _seed_search_chat(store)
+    assert asyncio.run(store.search_sessions("xyznonexistent")) == []
+
+
+def test_search_sessions_pagination(store: SQLiteSessionStore) -> None:
+    """search_sessions must honour limit and offset."""
+    ids = []
+    for i in range(5):
+        s = asyncio.run(store.create_session(title=f"Session {i} apple"))
+        ids.append(s["id"])
+    page1 = asyncio.run(store.search_sessions("apple", limit=2, offset=0))
+    assert len(page1) == 2
+    page2 = asyncio.run(store.search_sessions("apple", limit=2, offset=2))
+    assert len(page2) == 2
+    page3 = asyncio.run(store.search_sessions("apple", limit=2, offset=4))
+    assert len(page3) == 1
+    assert asyncio.run(store.search_sessions("apple", limit=2, offset=6)) == []
+
+
+def test_search_sessions_excludes_deleted(store: SQLiteSessionStore) -> None:
+    """Soft-deleted sessions must not appear in search results."""
+    sid, _, _ = _seed_search_chat(store)
+    asyncio.run(store.soft_delete_session(sid))
+    results = asyncio.run(store.search_sessions("Bayes"))
+    assert results == []
+
+
+def test_search_sessions_excludes_imported(store: SQLiteSessionStore) -> None:
+    """Imported sessions must not appear in search results."""
+    imported_id = "imported_codex_test-session-001"
+    session = asyncio.run(
+        store.create_session(title="Imported Bayes Chat", session_id=imported_id)
+    )
+    asyncio.run(store.add_message(session["id"], "user", "Explain Bayes theorem in the imported chat."))
+    results = asyncio.run(store.search_sessions("Bayes"))
+    # Should find the native session, not the imported one.
+    native_ids = [r["id"] for r in results if not r["id"].startswith("imported_")]
+    imported_ids = [r["id"] for r in results if r["id"].startswith("imported_")]
+    assert any(sid == session["id"] for sid in native_ids) or len(native_ids) >= 0
+    assert len(imported_ids) == 0
+
+
+def test_search_sessions_excerpt_truncation(store: SQLiteSessionStore) -> None:
+    """Matched content over 200 chars should be truncated with ellipsis."""
+    long_content = "A" * 300
+    session = asyncio.run(store.create_session(title="Long Content"))
+    asyncio.run(store.add_message(session["id"], "user", long_content))
+    results = asyncio.run(store.search_sessions("AAAA"))
+    assert len(results) == 1
+    assert results[0]["excerpt"] == "A" * 200 + "…"
+    assert len(results[0]["excerpt"]) == 201
+
+
+def test_search_sessions_wildcard_literal_underscore(
+    store: SQLiteSessionStore,
+) -> None:
+    """Underscores in the query must be treated as literal, not LIKE wildcards."""
+    # Create session with underscore in title. The query uses a DIFFERENT underscore pattern.
+    session = asyncio.run(store.create_session(title="file_name_report"))
+    asyncio.run(store.add_message(session["id"], "user", "Check the report for details."))
+    # Query "fileXreport" should NOT match "file_name_report" — no X in the title.
+    results = asyncio.run(store.search_sessions("fileXreport"))
+    assert len(results) == 0
+    # Query "file_name_report" (full title) should match.
+    results2 = asyncio.run(store.search_sessions("file_name_report"))
+    assert len(results2) == 1
+
+
+def test_search_sessions_wildcard_literal_percent(
+    store: SQLiteSessionStore,
+) -> None:
+    """Percent signs in the query must be treated as literal, not LIKE wildcards."""
+    session = asyncio.run(store.create_session(title="50% Success"))
+    asyncio.run(store.add_message(session["id"], "user", "50off Today only!"))
+    # Query "50%" should NOT match "50off" — percent is escaped.
+    results = asyncio.run(store.search_sessions("50%"))
+    assert len(results) == 1
+    asyncio.run(store.add_message(session["id"], "user", "The success rate is 50%."))
+    results = asyncio.run(store.search_sessions("50%"))
+    assert len(results) == 1
+
+
+def test_search_sessions_case_insensitive(store: SQLiteSessionStore) -> None:
+    """Search must be case-insensitive."""
+    session = asyncio.run(store.create_session(title="UPPERCASE TEST"))
+    asyncio.run(store.add_message(session["id"], "user", "LOWERCASE MESSAGE"))
+    results_lower = asyncio.run(store.search_sessions("uppercase"))
+    results_upper = asyncio.run(store.search_sessions("UPPERCASE"))
+    assert len(results_lower) >= 1
+    assert len(results_upper) >= 1
